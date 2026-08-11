@@ -236,6 +236,48 @@ function diskbench($dir,$size=512,$bufmb=4){
  finally{if(!$KeepTemp-and(test-path -literalpath $file)){rm -literalpath $file -Force -ea silentlycontinue}}
 }
 
+function gpubench($dir,$sec=8,$elevated=$false){
+ say "GPU test: Direct3D ALU shader workload, $sec sec."
+ $winsat=Get-Command WinSAT.exe -ea silentlycontinue|select -first 1
+ if(!$winsat){
+  return [pscustomobject]@{Test='GPU Direct3D (WinSAT)';RequestedSeconds=$sec;Error='WinSAT.exe is not available on this Windows installation.'}
+ }
+ if(!$elevated){
+  return [pscustomobject]@{Test='GPU Direct3D (WinSAT)';RequestedSeconds=$sec;Error='GPU test requires an elevated PowerShell session. Run WinBench as Administrator.'}
+ }
+
+ $xml=join-path $dir ("winbench-gpu-"+[guid]::NewGuid().ToString('N')+'.xml')
+ $args=@(
+  'd3d','-totalobj','20','-objs','C(20)','-totaltex','10','-texpobj','C(1)',
+  '-alushader','-noalpha','-NoDisp','-fixedseed','-time',[string]$sec,'-xml',$xml
+ )
+ $raw=@();$exitCode=$null
+ try{
+  $old=$ErrorActionPreference;$ErrorActionPreference='Continue'
+  try{$raw=@(& $winsat.Source @args 2>&1|%{$_.ToString()});$exitCode=$LASTEXITCODE}
+  finally{$ErrorActionPreference=$old}
+
+  if($exitCode-ne 0){throw "WinSAT exited with code $exitCode. $($raw -join ' ')"}
+  if(!(test-path -literalpath $xml)){throw 'WinSAT completed without producing its XML result.'}
+
+  [xml]$doc=Get-Content -literalpath $xml -Raw
+  $nodes=@($doc.SelectNodes("//*[local-name()='Results'][*[local-name()='FPS']]"))
+  $fps=@($nodes|%{[double]$_.FPS}|?{$_-ge 0})
+  if(!$fps.Count){throw 'WinSAT did not return a Direct3D frame-rate result.'}
+  $m=$fps|measure -Average -Minimum -Maximum
+  [long]$frames=($nodes|%{if($_.FramesRendered){[long]$_.FramesRendered}else{0}}|measure -Sum).Sum
+  [pscustomobject]@{
+   Test='GPU Direct3D (WinSAT)';Workload='ALU shader';RequestedSeconds=$sec;Subtests=$fps.Count
+   AverageFPS=[math]::Round($m.Average,2);MinimumFPS=[math]::Round($m.Minimum,2);MaximumFPS=[math]::Round($m.Maximum,2)
+   FramesRendered=$frames;ExitCode=$exitCode
+  }
+ }catch{
+  [pscustomobject]@{Test='GPU Direct3D (WinSAT)';RequestedSeconds=$sec;ExitCode=$exitCode;Error=$_.Exception.Message}
+ }finally{
+  if(!$KeepTemp-and(test-path -literalpath $xml)){rm -literalpath $xml -Force -ea silentlycontinue}
+ }
+}
+
 function cpuwithtele($job,$seconds,$nv,$every=1){
  $defs=@{}
  foreach($n in 'telemetry','counters','counterok','ckey','nvrow'){
@@ -280,6 +322,7 @@ body{font-family:"Segoe UI",Arial,sans-serif;margin:28px;background:#111;color:#
 <li>Disk read results can be influenced by Windows and storage caching.</li>
 <li>CPU temperature is omitted because Windows does not expose one universally reliable native CPU-temperature interface across systems.</li>
 <li>NVIDIA telemetry appears only when <code>nvidia-smi</code> is already present.</li>
+<li>The GPU benchmark is an off-screen Direct3D ALU-shader workload provided by WinSAT and requires an elevated PowerShell session.</li>
 </ul></div></body></html>
 "@
  [IO.File]::WriteAllText($path,$body,[Text.UTF8Encoding]::new($false))
@@ -325,8 +368,8 @@ function runbench($mode){
  if($mode-eq'Telemetry'){
   hdr Telemetry;$tele=@(telemetry $TelemetrySeconds $SampleInterval $nv)
  }else{
-  if($mode-eq'Quick'){$cpuSecs=8;$memPasses=10;$diskMB=256;$cpuTele=10}
-  else{$cpuSecs=20;$memPasses=24;$diskMB=1024;$cpuTele=22}
+  if($mode-eq'Quick'){$cpuSecs=8;$memPasses=10;$diskMB=256;$cpuTele=10;$gpuSecs=8}
+  else{$cpuSecs=20;$memPasses=24;$diskMB=1024;$cpuTele=22;$gpuSecs=15}
 
   hdr 'CPU Benchmark'
   $pair=cpuwithtele {cpubench $cpuSecs $sys.LogicalProcessors} $cpuTele $nv $SampleInterval
@@ -336,6 +379,11 @@ function runbench($mode){
   hdr 'Memory Benchmark'
   $m=membench 64 $memPasses;$bench+=$m
   if($m.PSObject.Properties['ThroughputMiBps']){good ("Memory copy: {0:N2} MiB/sec"-f$m.ThroughputMiBps)}else{warnx "Memory test failed: $($m.Error)"}
+
+  hdr 'GPU Benchmark'
+  $pair=cpuwithtele {gpubench $tmp $gpuSecs $sys.IsElevated} ($gpuSecs+8) $nv $SampleInterval
+  $g=$pair.Result;$tele+=@($pair.Telemetry);$bench+=$g
+  if($g.PSObject.Properties['AverageFPS']){good ("GPU Direct3D: {0:N2} average FPS | {1:N0} frames"-f$g.AverageFPS,$g.FramesRendered)}else{warnx "GPU test skipped or failed: $($g.Error)"}
 
   hdr 'Disk Benchmark'
   $d=diskbench $tmp $diskMB 4;$bench+=$d
@@ -367,154 +415,35 @@ try{
 }
 
 # SIG # Begin signature block
-# MIIb8gYJKoZIhvcNAQcCoIIb4zCCG98CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
-# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQURQggUS57p0pjvXEbqM4+Zw7M
-# mjOgghZYMIIDGjCCAgKgAwIBAgIQSHk2u471qKhEmswFQlqdXzANBgkqhkiG9w0B
-# AQsFADAlMSMwIQYDVQQDDBpNeSBQb3dlclNoZWxsIENvZGUgU2lnbmluZzAeFw0y
-# NjA4MTEwMjAwMTlaFw0yNzA4MTEwMjIwMTlaMCUxIzAhBgNVBAMMGk15IFBvd2Vy
-# U2hlbGwgQ29kZSBTaWduaW5nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
-# AQEAyRFWb2ks5GKrrdHBwAb3I0YUJmEo7JWGJC4R2ivfSIs6DUtMS98M+HpKnOWp
-# MpMRL3o3AOi3hFOGl5OzMnOSCKwe11fnFAHBZxtAA/ec4Cl+Xx8+93W+yGlgcG04
-# bWztAygCOtd0LShsjZjFlD3iXLY7qFOkEZ/sKleLxC/IcoFiiYaDP6Mt4hjmMIEU
-# GsGw323FERIBKwa8jM1LoIKsER00pq8QFWHqU2KmgGFCp0YZtyhDz7G73hgFI9N9
-# 0kSGZvU0dJHfMOtBcIMG16O4slIeEPtgd5iotQ3tdD8TM9Q+8dhLIRLscT/2eXFf
-# q0BQNWZVMnopCi4DU5QoFokAQQIDAQABo0YwRDAOBgNVHQ8BAf8EBAMCB4AwEwYD
-# VR0lBAwwCgYIKwYBBQUHAwMwHQYDVR0OBBYEFFmA95+8/hJgCm8KIIM5ab5OVBKv
-# MA0GCSqGSIb3DQEBCwUAA4IBAQCmms7kh52g6Q+MKzpDfy73TIGrbETikrmQ1wBa
-# IMbYzJhLJO06VdkZHY1snmvRINjWgFjC74XxnExMo6T67n9mNn9xKZ8Lgp4nx4vy
-# muUEivXy6SHwVBZ+ZOjdXayPimLv530xxoncPFFa0ArcQduNa9hKaALOEemopI/z
-# A7vhvn4E3fsyCxsbwbk2AT5HChwk1sjqKobEH64J1sRr1VFXSzZPw6SxVt05CGpU
-# SuBFrSRQB89t4tGcXvIwK+F2gnpMGhIPiHzTY+V41aLlZJEhWiNAj4gZY9K1XRpT
-# zN4mIvngkwx5lgyOixGe+5oUtrT/bq7DRgLIARjpVZHuNj9bMIIFjTCCBHWgAwIB
-# AgIQDpsYjvnQLefv21DiCEAYWjANBgkqhkiG9w0BAQwFADBlMQswCQYDVQQGEwJV
-# UzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQu
-# Y29tMSQwIgYDVQQDExtEaWdpQ2VydCBBc3N1cmVkIElEIFJvb3QgQ0EwHhcNMjIw
-# ODAxMDAwMDAwWhcNMzExMTA5MjM1OTU5WjBiMQswCQYDVQQGEwJVUzEVMBMGA1UE
-# ChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSEwHwYD
-# VQQDExhEaWdpQ2VydCBUcnVzdGVkIFJvb3QgRzQwggIiMA0GCSqGSIb3DQEBAQUA
-# A4ICDwAwggIKAoICAQC/5pBzaN675F1KPDAiMGkz7MKnJS7JIT3yithZwuEppz1Y
-# q3aaza57G4QNxDAf8xukOBbrVsaXbR2rsnnyyhHS5F/WBTxSD1Ifxp4VpX6+n6lX
-# FllVcq9ok3DCsrp1mWpzMpTREEQQLt+C8weE5nQ7bXHiLQwb7iDVySAdYyktzuxe
-# TsiT+CFhmzTrBcZe7FsavOvJz82sNEBfsXpm7nfISKhmV1efVFiODCu3T6cw2Vbu
-# yntd463JT17lNecxy9qTXtyOj4DatpGYQJB5w3jHtrHEtWoYOAMQjdjUN6QuBX2I
-# 9YI+EJFwq1WCQTLX2wRzKm6RAXwhTNS8rhsDdV14Ztk6MUSaM0C/CNdaSaTC5qmg
-# Z92kJ7yhTzm1EVgX9yRcRo9k98FpiHaYdj1ZXUJ2h4mXaXpI8OCiEhtmmnTK3kse
-# 5w5jrubU75KSOp493ADkRSWJtppEGSt+wJS00mFt6zPZxd9LBADMfRyVw4/3IbKy
-# Ebe7f/LVjHAsQWCqsWMYRJUadmJ+9oCw++hkpjPRiQfhvbfmQ6QYuKZ3AeEPlAwh
-# HbJUKSWJbOUOUlFHdL4mrLZBdd56rF+NP8m800ERElvlEFDrMcXKchYiCd98THU/
-# Y+whX8QgUWtvsauGi0/C1kVfnSD8oR7FwI+isX4KJpn15GkvmB0t9dmpsh3lGwID
-# AQABo4IBOjCCATYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQU7NfjgtJxXWRM
-# 3y5nP+e6mK4cD08wHwYDVR0jBBgwFoAUReuir/SSy4IxLVGLp6chnfNtyA8wDgYD
-# VR0PAQH/BAQDAgGGMHkGCCsGAQUFBwEBBG0wazAkBggrBgEFBQcwAYYYaHR0cDov
-# L29jc3AuZGlnaWNlcnQuY29tMEMGCCsGAQUFBzAChjdodHRwOi8vY2FjZXJ0cy5k
-# aWdpY2VydC5jb20vRGlnaUNlcnRBc3N1cmVkSURSb290Q0EuY3J0MEUGA1UdHwQ+
-# MDwwOqA4oDaGNGh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydEFzc3Vy
-# ZWRJRFJvb3RDQS5jcmwwEQYDVR0gBAowCDAGBgRVHSAAMA0GCSqGSIb3DQEBDAUA
-# A4IBAQBwoL9DXFXnOF+go3QbPbYW1/e/Vwe9mqyhhyzshV6pGrsi+IcaaVQi7aSI
-# d229GhT0E0p6Ly23OO/0/4C5+KH38nLeJLxSA8hO0Cre+i1Wz/n096wwepqLsl7U
-# z9FDRJtDIeuWcqFItJnLnU+nBgMTdydE1Od/6Fmo8L8vC6bp8jQ87PcDx4eo0kxA
-# GTVGamlUsLihVo7spNU96LHc/RzY9HdaXFSMb++hUD38dglohJ9vytsgjTVgHAID
-# yyCwrFigDkBjxZgiwbJZ9VVrzyerbHbObyMt9H5xaiNrIv8SuFQtJ37YOtnwtoeW
-# /VvRXKwYw02fc7cBqZ9Xql4o4rmUMIIGtDCCBJygAwIBAgIQDcesVwX/IZkuQEMi
-# DDpJhjANBgkqhkiG9w0BAQsFADBiMQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGln
-# aUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSEwHwYDVQQDExhE
-# aWdpQ2VydCBUcnVzdGVkIFJvb3QgRzQwHhcNMjUwNTA3MDAwMDAwWhcNMzgwMTE0
-# MjM1OTU5WjBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4x
-# QTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQw
-# OTYgU0hBMjU2IDIwMjUgQ0ExMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKC
-# AgEAtHgx0wqYQXK+PEbAHKx126NGaHS0URedTa2NDZS1mZaDLFTtQ2oRjzUXMmxC
-# qvkbsDpz4aH+qbxeLho8I6jY3xL1IusLopuW2qftJYJaDNs1+JH7Z+QdSKWM06qc
-# hUP+AbdJgMQB3h2DZ0Mal5kYp77jYMVQXSZH++0trj6Ao+xh/AS7sQRuQL37QXbD
-# hAktVJMQbzIBHYJBYgzWIjk8eDrYhXDEpKk7RdoX0M980EpLtlrNyHw0Xm+nt5pn
-# YJU3Gmq6bNMI1I7Gb5IBZK4ivbVCiZv7PNBYqHEpNVWC2ZQ8BbfnFRQVESYOszFI
-# 2Wv82wnJRfN20VRS3hpLgIR4hjzL0hpoYGk81coWJ+KdPvMvaB0WkE/2qHxJ0ucS
-# 638ZxqU14lDnki7CcoKCz6eum5A19WZQHkqUJfdkDjHkccpL6uoG8pbF0LJAQQZx
-# st7VvwDDjAmSFTUms+wV/FbWBqi7fTJnjq3hj0XbQcd8hjj/q8d6ylgxCZSKi17y
-# Vp2NL+cnT6Toy+rN+nM8M7LnLqCrO2JP3oW//1sfuZDKiDEb1AQ8es9Xr/u6bDTn
-# YCTKIsDq1BtmXUqEG1NqzJKS4kOmxkYp2WyODi7vQTCBZtVFJfVZ3j7OgWmnhFr4
-# yUozZtqgPrHRVHhGNKlYzyjlroPxul+bgIspzOwbtmsgY1MCAwEAAaOCAV0wggFZ
-# MBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFO9vU0rp5AZ8esrikFb2L9RJ
-# 7MtOMB8GA1UdIwQYMBaAFOzX44LScV1kTN8uZz/nupiuHA9PMA4GA1UdDwEB/wQE
-# AwIBhjATBgNVHSUEDDAKBggrBgEFBQcDCDB3BggrBgEFBQcBAQRrMGkwJAYIKwYB
-# BQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBBBggrBgEFBQcwAoY1aHR0
-# cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZFJvb3RHNC5j
-# cnQwQwYDVR0fBDwwOjA4oDagNIYyaHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0Rp
-# Z2lDZXJ0VHJ1c3RlZFJvb3RHNC5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIwCwYJ
-# YIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQAXzvsWgBz+Bz0RdnEwvb4LyLU0
-# pn/N0IfFiBowf0/Dm1wGc/Do7oVMY2mhXZXjDNJQa8j00DNqhCT3t+s8G0iP5kvN
-# 2n7Jd2E4/iEIUBO41P5F448rSYJ59Ib61eoalhnd6ywFLerycvZTAz40y8S4F3/a
-# +Z1jEMK/DMm/axFSgoR8n6c3nuZB9BfBwAQYK9FHaoq2e26MHvVY9gCDA/JYsq7p
-# GdogP8HRtrYfctSLANEBfHU16r3J05qX3kId+ZOczgj5kjatVB+NdADVZKON/gnZ
-# ruMvNYY2o1f4MXRJDMdTSlOLh0HCn2cQLwQCqjFbqrXuvTPSegOOzr4EWj7PtspI
-# HBldNE2K9i697cvaiIo2p61Ed2p8xMJb82Yosn0z4y25xUbI7GIN/TpVfHIqQ6Ku
-# /qjTY6hc3hsXMrS+U0yy+GWqAXam4ToWd2UQ1KYT70kZjE4YtL8Pbzg0c1ugMZyZ
-# Zd/BdHLiRu7hAWE6bTEm4XYRkA6Tl4KSFLFk43esaUeqGkH/wyW4N7OigizwJWeu
-# kcyIPbAvjSabnf7+Pu0VrFgoiovRDiyx3zEdmcif/sYQsfch28bZeUz2rtY/9TCA
-# 6TD8dC3JE3rYkrhLULy7Dc90G6e8BlqmyIjlgp2+VqsS9/wQD7yFylIz0scmbKvF
-# oW2jNrbM1pD2T7m3XDCCBu0wggTVoAMCAQICEAqA7xhLjfEFgtHEdqeVdGgwDQYJ
-# KoZIhvcNAQELBQAwaTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJ
-# bmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBS
-# U0E0MDk2IFNIQTI1NiAyMDI1IENBMTAeFw0yNTA2MDQwMDAwMDBaFw0zNjA5MDMy
-# MzU5NTlaMGMxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjE7
-# MDkGA1UEAxMyRGlnaUNlcnQgU0hBMjU2IFJTQTQwOTYgVGltZXN0YW1wIFJlc3Bv
-# bmRlciAyMDI1IDEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDQRqwt
-# Esae0OquYFazK1e6b1H/hnAKAd/KN8wZQjBjMqiZ3xTWcfsLwOvRxUwXcGx8AUjn
-# i6bz52fGTfr6PHRNv6T7zsf1Y/E3IU8kgNkeECqVQ+3bzWYesFtkepErvUSbf+EI
-# YLkrLKd6qJnuzK8Vcn0DvbDMemQFoxQ2Dsw4vEjoT1FpS54dNApZfKY61HAldytx
-# NM89PZXUP/5wWWURK+IfxiOg8W9lKMqzdIo7VA1R0V3Zp3DjjANwqAf4lEkTlCDQ
-# 0/fKJLKLkzGBTpx6EYevvOi7XOc4zyh1uSqgr6UnbksIcFJqLbkIXIPbcNmA98Os
-# kkkrvt6lPAw/p4oDSRZreiwB7x9ykrjS6GS3NR39iTTFS+ENTqW8m6THuOmHHjQN
-# C3zbJ6nJ6SXiLSvw4Smz8U07hqF+8CTXaETkVWz0dVVZw7knh1WZXOLHgDvundrA
-# tuvz0D3T+dYaNcwafsVCGZKUhQPL1naFKBy1p6llN3QgshRta6Eq4B40h5avMcpi
-# 54wm0i2ePZD5pPIssoszQyF4//3DoK2O65Uck5Wggn8O2klETsJ7u8xEehGifgJY
-# i+6I03UuT1j7FnrqVrOzaQoVJOeeStPeldYRNMmSF3voIgMFtNGh86w3ISHNm0Ia
-# adCKCkUe2LnwJKa8TIlwCUNVwppwn4D3/Pt5pwIDAQABo4IBlTCCAZEwDAYDVR0T
-# AQH/BAIwADAdBgNVHQ4EFgQU5Dv88jHt/f3X85FxYxlQQ89hjOgwHwYDVR0jBBgw
-# FoAU729TSunkBnx6yuKQVvYv1Ensy04wDgYDVR0PAQH/BAQDAgeAMBYGA1UdJQEB
-# /wQMMAoGCCsGAQUFBwMIMIGVBggrBgEFBQcBAQSBiDCBhTAkBggrBgEFBQcwAYYY
-# aHR0cDovL29jc3AuZGlnaWNlcnQuY29tMF0GCCsGAQUFBzAChlFodHRwOi8vY2Fj
-# ZXJ0cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRUaW1lU3RhbXBpbmdS
-# U0E0MDk2U0hBMjU2MjAyNUNBMS5jcnQwXwYDVR0fBFgwVjBUoFKgUIZOaHR0cDov
-# L2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZEc0VGltZVN0YW1waW5n
-# UlNBNDA5NlNIQTI1NjIwMjVDQTEuY3JsMCAGA1UdIAQZMBcwCAYGZ4EMAQQCMAsG
-# CWCGSAGG/WwHATANBgkqhkiG9w0BAQsFAAOCAgEAZSqt8RwnBLmuYEHs0QhEnmNA
-# ciH45PYiT9s1i6UKtW+FERp8FgXRGQ/YAavXzWjZhY+hIfP2JkQ38U+wtJPBVBaj
-# YfrbIYG+Dui4I4PCvHpQuPqFgqp1PzC/ZRX4pvP/ciZmUnthfAEP1HShTrY+2DE5
-# qjzvZs7JIIgt0GCFD9ktx0LxxtRQ7vllKluHWiKk6FxRPyUPxAAYH2Vy1lNM4kze
-# kd8oEARzFAWgeW3az2xejEWLNN4eKGxDJ8WDl/FQUSntbjZ80FU3i54tpx5F/0Kr
-# 15zW/mJAxZMVBrTE2oi0fcI8VMbtoRAmaaslNXdCG1+lqvP4FbrQ6IwSBXkZagHL
-# hFU9HCrG/syTRLLhAezu/3Lr00GrJzPQFnCEH1Y58678IgmfORBPC1JKkYaEt2Od
-# Dh4GmO0/5cHelAK2/gTlQJINqDr6JfwyYHXSd+V08X1JUPvB4ILfJdmL+66Gp3CS
-# BXG6IwXMZUXBhtCyIaehr0XkBoDIGMUG1dUtwq1qmcwbdUfcSYCn+OwncVUXf53V
-# JUNOaMWMts0VlRYxe5nK+At+DI96HAlXHAL5SlfYxJ7La54i71McVWRP66bW+yER
-# NpbJCjyCYG2j+bdpxo/1Cy4uPcU3AWVPGrbn5PhDBf3Froguzzhk++ami+r3Qrx5
-# bIbY3TVzgiFI7Gq3zWcxggUEMIIFAAIBATA5MCUxIzAhBgNVBAMMGk15IFBvd2Vy
-# U2hlbGwgQ29kZSBTaWduaW5nAhBIeTa7jvWoqESazAVCWp1fMAkGBSsOAwIaBQCg
-# eDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEE
-# AYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqGSIb3DQEJ
-# BDEWBBRlRYQ6Hea5WwpvIjjPTrVW7QfGUTANBgkqhkiG9w0BAQEFAASCAQB7NJFE
-# mz+gd+b6QxmrGfnPs9hYv4x2NtecU9yOiVXexNCRfttSB/Jf/l7+hmlOOHzz+6Nz
-# X176X24F61sLNKiRmw6G4fVuWIzVHQgbcDJhfpLpZX1TQOvp4yeCtarPM90eE8N0
-# //Lofc67g5aWOniYJB3YcqFk4AaqDMfs1EFmixElk6PFTE65LH/dOfrTn+kFkDa4
-# LddDzmp9hajB4UokvnOh6aX8b/uyFw5BuurzZp88GOVCyv4+MKDoAtVv9qMQUiIV
-# CQLgRY8ufHBNuOG6Wa7d1NKKXhMYMoJqE34ECCk8YvUwaLr1ho7+M2Xdgy6dG8cO
-# Fkzf4Ool6rpOnmmfoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEBMH0waTEL
-# MAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhE
-# aWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNIQTI1NiAy
-# MDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0aDANBglghkgBZQMEAgEFAKBpMBgGCSqG
-# SIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDgxMTAyMTM1
-# MFowLwYJKoZIhvcNAQkEMSIEIHLqX/4sZEj/ImyIVVryMF+OQzJxW+X++CEIJXMJ
-# 1n8TMA0GCSqGSIb3DQEBAQUABIICALJXfbu3WYgFrnM2JKVK6ej7OytH3xJRy4NX
-# NHiKTxP1qC/k6ZsVZz8aDCLtiMDxp5QYA1lO+cVDXS9hF6/6UWeZNBGDPFqhAwyJ
-# dJhVklRp4Na42ipS2SWWPicO5DzehqebNYUDnV9BTK+Crl6OF9a8h6tu4Otogcm+
-# aU5ITed7RV7A3iQa8jkNNEpYyeZ7OwqSVxX7DccQHcEM4VCX1q0xoC6n2KHwE80Z
-# rh323J4zqwe75fkhi6cCfCQwX9JKfjcrHhvcYKFjUG2xF/SGb+PA0M2Rj4KBrBh+
-# 1E5jhptN3ll1ziGo1HUEBPd5yc2dBoOi2NF9c/OO733W3avbXAD60JMS5Istlpip
-# PyFhIoY55rqQ/UW+1YYdt/opZiCYmg+0FBoQiOYdvN8KnGRQm0s/fz8DHfphQc5x
-# jyKd4KksAJJ0yHgZbem0r3wb0ob7ryegff+i9zH8owZvIu5CPRg2B807ps7+6YMf
-# ZhkmNejEEyiDL23KUL8VoFG9krbjXVVC3Kjg938UN0UY/mEdlLLxLIfThLJBRF+E
-# evt5NzMFHsSWHV0Bl9hThEumhirv26V1lD2D5GNcUNmjIoCtcMyO9wXDACnOYDNW
-# kiy05m9cjrF//lW8ak+r46veVXgZ4+c1xNhLjy4KJlAtYL/0ieRfX7zTvcHF0z3G
-# HITYQV9J
+# MIIFswYJKoZIhvcNAQcCoIIFpDCCBaACAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAqFQT5CbN0GBYc
+# 7TRkjqQvC6ks2JFCCNcLoA/2PZahUaCCAx4wggMaMIICAqADAgECAhBIeTa7jvWo
+# qESazAVCWp1fMA0GCSqGSIb3DQEBCwUAMCUxIzAhBgNVBAMMGk15IFBvd2VyU2hl
+# bGwgQ29kZSBTaWduaW5nMB4XDTI2MDgxMTAyMDAxOVoXDTI3MDgxMTAyMjAxOVow
+# JTEjMCEGA1UEAwwaTXkgUG93ZXJTaGVsbCBDb2RlIFNpZ25pbmcwggEiMA0GCSqG
+# SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDJEVZvaSzkYqut0cHABvcjRhQmYSjslYYk
+# LhHaK99IizoNS0xL3wz4ekqc5akykxEvejcA6LeEU4aXk7Myc5IIrB7XV+cUAcFn
+# G0AD95zgKX5fHz73db7IaWBwbThtbO0DKAI613QtKGyNmMWUPeJctjuoU6QRn+wq
+# V4vEL8hygWKJhoM/oy3iGOYwgRQawbDfbcUREgErBryMzUuggqwRHTSmrxAVYepT
+# YqaAYUKnRhm3KEPPsbveGAUj033SRIZm9TR0kd8w60FwgwbXo7iyUh4Q+2B3mKi1
+# De10PxMz1D7x2EshEuxxP/Z5cV+rQFA1ZlUyeikKLgNTlCgWiQBBAgMBAAGjRjBE
+# MA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAzAdBgNVHQ4EFgQU
+# WYD3n7z+EmAKbwoggzlpvk5UEq8wDQYJKoZIhvcNAQELBQADggEBAKaazuSHnaDp
+# D4wrOkN/LvdMgatsROKSuZDXAFogxtjMmEsk7TpV2RkdjWyea9Eg2NaAWMLvhfGc
+# TEyjpPruf2Y2f3EpnwuCnifHi/Ka5QSK9fLpIfBUFn5k6N1drI+KYu/nfTHGidw8
+# UVrQCtxB241r2EpoAs4R6aikj/MDu+G+fgTd+zILGxvBuTYBPkcKHCTWyOoqhsQf
+# rgnWxGvVUVdLNk/DpLFW3TkIalRK4EWtJFAHz23i0Zxe8jAr4XaCekwaEg+IfNNj
+# 5XjVouVkkSFaI0CPiBlj0rVdGlPM3iYi+eCTDHmWDI6LEZ77mhS2tP9ursNGAsgB
+# GOlVke42P1sxggHrMIIB5wIBATA5MCUxIzAhBgNVBAMMGk15IFBvd2VyU2hlbGwg
+# Q29kZSBTaWduaW5nAhBIeTa7jvWoqESazAVCWp1fMA0GCWCGSAFlAwQCAQUAoIGE
+# MBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQB
+# gjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkE
+# MSIEIPa05p5N944nytJ+13DRdx2Xl/B7NjTC7/+iusY7JJ4oMA0GCSqGSIb3DQEB
+# AQUABIIBACBE5gm60frUKZGLFC/mJC4xFnvqYYXykBWweS5+zXtDAswEkDygZJvx
+# t0WqSSHuWG/XIhyd28IvJeSXN/v/KpkA7g2zEB0u7hj9yTDdpgxpgrlGb4bjQLlN
+# XgJjwnJFgzKyJ192D3HnAva9RiShJ0cWyv3H0fqBQbiw3O8i233M64jmGpmNrfUm
+# zE6lu/H5Ex+jv7gRuPXUhGcGftZNFE+8R8snSRabQZFxnS/1rIk56GWEh7Toyq3j
+# 1F/KowunowmgxBYaEzpVStdl74vVVAdB6IGXRWib1PAfsn3aFSbM+IRMqIf9deYo
+# CzUq4XuvELqiVyTJkf3E61MActzt8NU=
 # SIG # End signature block
